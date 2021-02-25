@@ -67,6 +67,17 @@ if __name__ == '__main__':
         description='Image pair matching and pose evaluation with SuperGlue',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+    # parser.add_argument(
+    #     '--input_pairs', type=str, default='assets/scannet_sample_pairs_with_gt.txt',
+    #     help='Path to the list of image pairs')
+    # parser.add_argument(
+    #     '--input_dir', type=str, default='assets/scannet_sample_images/',
+    #     help='Path to the directory that contains the images')
+    # parser.add_argument(
+    #     '--output_dir', type=str, default='dump_match_pairs/',
+    #     help='Path to the directory in which the .npz results and optionally,'
+    #          'the visualization images are written')
+
     parser.add_argument(
         '--viz', action='store_true',
         help='Visualize the matches and dump the plots')
@@ -76,8 +87,7 @@ if __name__ == '__main__':
              ' (requires ground truth pose and intrinsics)')
 
     parser.add_argument(
-        '--superglue', choices={'indoor', 'outdoor'}, default='indoor',
-        help='SuperGlue weights')
+        '--superglue', type=str, help='SuperGlue weights')
     parser.add_argument(
         '--max_keypoints', type=int, default=1024,
         help='Maximum number of keypoints detected by Superpoint'
@@ -259,9 +269,9 @@ if __name__ == '__main__':
 
         # Load the image pair.
         image0, inp0, scales0 = read_image(
-            data_dir / name0, device, opt.resize, rot0, opt.resize_float)
+            data_dir / name0, opt.resize, rot0, opt.resize_float)
         image1, inp1, scales1 = read_image(
-            data_dir / name1, device, opt.resize, rot1, opt.resize_float)
+            data_dir / name1, opt.resize, rot1, opt.resize_float)
         if image0 is None or image1 is None:
             print('Problem reading image pair: {} {}'.format(
                 data_dir/name0, data_dir/name1))
@@ -271,7 +281,14 @@ if __name__ == '__main__':
         if do_match:
             # Perform the matching.
             pred = matching({'image0': inp0, 'image1': inp1})
-            pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+            pred_np = {}
+            for (k, v) in pred.items():
+                if isinstance(v, list):
+                    pred_np[k] = v[0].cpu().numpy()
+                elif isinstance(v, torch.Tensor):
+                    pred_np[k] = v.cpu().numpy()
+            pred = pred_np
+            # pred = {k: v[0].cpu().numpy() for k, v in pred.items() if isinstance(v, torch.Tensor)}
             kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
             matches, conf = pred['matches0'], pred['matching_scores0']
             timer.update('matcher')

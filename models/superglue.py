@@ -44,6 +44,23 @@ from copy import deepcopy
 from pathlib import Path
 import torch
 from torch import nn
+from pytorch_lightning import LightningModule
+from omegaconf import DictConfig
+from torch.autograd import Variable
+import matplotlib.cm as cm
+from os.path import abspath, dirname
+
+
+
+from load_data import SparseDataset
+from models.superpoint import SuperPoint
+from models.utils import (compute_pose_error, compute_epipolar_error,
+                          estimate_pose, make_matching_plot,
+                          error_colormap, AverageTimer, pose_auc, read_image,
+                          rotate_intrinsics, rotate_pose_inplane,
+                          scale_intrinsics, read_image_modified)
+
+ROOT_PATH = dirname(dirname(abspath(__file__)))
 
 
 def MLP(channels: list, do_bn=True):
@@ -55,8 +72,8 @@ def MLP(channels: list, do_bn=True):
             nn.Conv1d(channels[i - 1], channels[i], kernel_size=1, bias=True))
         if i < (n-1):
             if do_bn:
-                # layers.append(nn.BatchNorm1d(channels[i]))
-                layers.append(nn.InstanceNorm1d(channels[i]))
+                layers.append(nn.BatchNorm1d(channels[i]))
+                # layers.append(nn.InstanceNorm1d(channels[i]))
             layers.append(nn.ReLU())
     return nn.Sequential(*layers)
 
@@ -80,7 +97,8 @@ class KeypointEncoder(nn.Module):
 
     def forward(self, kpts, scores):
         inputs = [kpts.transpose(1, 2), scores.unsqueeze(1)]
-        return self.encoder(torch.cat(inputs, dim=1))
+        inputs = torch.cat(inputs, dim=1)
+        return self.encoder(inputs)
 
 
 def attention(query, key, value):
@@ -196,9 +214,9 @@ class SuperGlue(nn.Module):
 
     """
     default_config = {
-        'descriptor_dim': 128,
+        'descriptor_dim': 256,  # 256,
         'weights': 'indoor',
-        'keypoint_encoder': [32, 64, 128],
+        'keypoint_encoder': [32, 64, 128, 256],  # ,  256],
         'GNN_layers': ['self', 'cross'] * 9,
         'sinkhorn_iterations': 100,
         'match_threshold': 0.2,
@@ -208,35 +226,30 @@ class SuperGlue(nn.Module):
         super().__init__()
         self.config = {**self.default_config, **config}
 
-        self.kenc = KeypointEncoder(
-            self.config['descriptor_dim'], self.config['keypoint_encoder'])
+        self.kenc = KeypointEncoder(self.config['descriptor_dim'], self.config['keypoint_encoder'])
 
-        self.gnn = AttentionalGNN(
-            self.config['descriptor_dim'], self.config['GNN_layers'])
+        self.gnn = AttentionalGNN(self.config['descriptor_dim'], self.config['GNN_layers'])
 
-        self.final_proj = nn.Conv1d(
-            self.config['descriptor_dim'], self.config['descriptor_dim'],
-            kernel_size=1, bias=True)
+        self.final_proj = nn.Conv1d(self.config['descriptor_dim'], self.config['descriptor_dim'], kernel_size=1, bias=True)
 
         bin_score = torch.nn.Parameter(torch.tensor(1.))
         self.register_parameter('bin_score', bin_score)
 
         # assert self.config['weights'] in ['indoor', 'outdoor']
-        # path = Path(__file__).parent
-        # path = path / 'weights/superglue_{}.pth'.format(self.config['weights'])
-        # self.load_state_dict(torch.load(path))
-        # print('Loaded SuperGlue model (\"{}\" weights)'.format(
-        #     self.config['weights']))
+        if self.config['weights'] is not None:
+            path = Path(__file__).parent.parent
+            path = path / self.config['weights']
+
+            state_dict = {k.replace('superglue.', ''): v for k, v in torch.load(path)['state_dict'].items()
+                          if 'superpoint' not in k}
+            self.load_state_dict(state_dict)
+            # self.load_state_dict(SuperGlueLightning.load_from_checkpoint(path).superpoint.state_dict())
+            print('Loaded SuperGlue model (\"{}\" weights)'.format(self.config['weights']))
 
     def forward(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
-        desc0, desc1 = data['descriptors0'].double(), data['descriptors1'].double()
-        kpts0, kpts1 = data['keypoints0'].double(), data['keypoints1'].double()
-
-        desc0 = desc0.transpose(0,1)
-        desc1 = desc1.transpose(0,1)
-        kpts0 = torch.reshape(kpts0, (1, -1, 2))
-        kpts1 = torch.reshape(kpts1, (1, -1, 2))
+        desc0, desc1 = data['descriptors0'].float(), data['descriptors1'].float()
+        kpts0, kpts1 = data['keypoints0'].float(), data['keypoints1'].float()
     
         if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
             shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
@@ -247,17 +260,14 @@ class SuperGlue(nn.Module):
                 'matching_scores1': kpts1.new_zeros(shape1)[0],
                 'skip_train': True
             }
-
-        file_name = data['file_name']
-        all_matches = data['all_matches'].permute(1,2,0) # shape=torch.Size([1, 87, 2])
         
         # Keypoint normalization.
         kpts0 = normalize_keypoints(kpts0, data['image0'].shape)
         kpts1 = normalize_keypoints(kpts1, data['image1'].shape)
 
         # Keypoint MLP encoder.
-        desc0 = desc0 + self.kenc(kpts0, torch.transpose(data['scores0'], 0, 1))
-        desc1 = desc1 + self.kenc(kpts1, torch.transpose(data['scores1'], 0, 1))
+        desc0 = desc0 + self.kenc(kpts0, data['scores0'].float())
+        desc1 = desc1 + self.kenc(kpts1, data['scores1'].float())
 
         # Multi-layer Transformer network.
         desc0, desc1 = self.gnn(desc0, desc1)
@@ -288,24 +298,148 @@ class SuperGlue(nn.Module):
         indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
 
         # check if indexed correctly
-        loss = []
-        for i in range(len(all_matches[0])):
-            x = all_matches[0][i][0]
-            y = all_matches[0][i][1]
-            loss.append(-torch.log( scores[0][x][y].exp() )) # check batch size == 1 ?
-        # for p0 in unmatched0:
-        #     loss += -torch.log(scores[0][p0][-1])
-        # for p1 in unmatched1:
-        #     loss += -torch.log(scores[0][-1][p1])
-        loss_mean = torch.mean(torch.stack(loss))
-        loss_mean = torch.reshape(loss_mean, (1, -1))
-        return {
-            'matches0': indices0[0], # use -1 for invalid match
-            'matches1': indices1[0], # use -1 for invalid match
-            'matching_scores0': mscores0[0],
-            'matching_scores1': mscores1[0],
-            'loss': loss_mean[0],
-            'skip_train': False
-        }
+        if 'all_matches' in data:
+            loss = []
+            all_matches = data['all_matches']  # shape=torch.Size([1, 87, 2])
+            for i in range(len(all_matches[0])):
+                x = all_matches[0][i][0]
+                y = all_matches[0][i][1]
+                loss.append(-torch.log( scores[0][x][y].exp() )) # check batch size == 1 ?
 
-        # scores big value or small value means confidence? log can't take neg value
+            # for p0 in unmatched0:
+            #     loss += -torch.log(scores[0][p0][-1])
+            # for p1 in unmatched1:
+            #     loss += -torch.log(scores[0][-1][p1])
+            loss_mean = torch.mean(torch.stack(loss))
+            loss_mean = torch.reshape(loss_mean, (1, -1))
+            # scores big value or small value means confidence? log can't take neg value
+            return {
+                'matches0': indices0[0], # use -1 for invalid match
+                'matches1': indices1[0], # use -1 for invalid match
+                'matching_scores0': mscores0[0],
+                'matching_scores1': mscores1[0],
+                'loss': loss_mean[0],
+                'skip_train': False
+            }
+        else:
+            return {
+                'matches0': indices0[0],  # use -1 for invalid match
+                'matches1': indices1[0],  # use -1 for invalid match
+                'matching_scores0': mscores0[0],
+                'matching_scores1': mscores1[0],
+                'loss': None,
+                'skip_train': True
+            }
+
+
+
+class SuperGlueLightning(LightningModule):
+
+    def __init__(self, args: DictConfig):
+        super().__init__()
+        self.hparams = args  # Will be logged to mlflow
+
+        # make sure the flags are properly used
+        assert not (args.exp.opencv_display and not args.exp.viz), 'Must use --viz with --opencv_display'
+        assert not (args.exp.opencv_display and not args.exp.fast_viz), 'Cannot use --opencv_display without --fast_viz'
+        assert not (args.exp.fast_viz and not args.exp.viz), 'Must use --viz with --fast_viz'
+        assert not (args.exp.fast_viz and args.exp.viz_extension == 'pdf'), 'Cannot use pdf extension with --fast_viz'
+
+        # store viz results
+        eval_output_dir = Path(f'{ROOT_PATH}/' + args.data.eval_output_dir)
+        eval_output_dir.mkdir(exist_ok=True, parents=True)
+        print('Will write visualization images to directory \"{}\"'.format(eval_output_dir))
+
+        self.superglue = SuperGlue(args.model.superglue)
+        self.superpoint = SuperPoint(args.model.superpoint)
+
+    def prepare_data(self) -> None:
+        self.train_set = SparseDataset(f'{ROOT_PATH}/' + self.hparams.data.train_path,
+                                       self.hparams.model.superpoint.max_keypoints,
+                                       self.hparams.data.resize,
+                                       self.hparams.data.resize_float,
+                                       self.superpoint)
+        self.val_set = SparseDataset(f'{ROOT_PATH}/' + self.hparams.data.val_path,
+                                     self.hparams.model.superpoint.max_keypoints,
+                                     self.hparams.data.resize,
+                                     self.hparams.data.resize_float,
+                                     self.superpoint)
+        self.val_set.files = self.val_set.files[:self.hparams.data.val_size]
+
+    def train_dataloader(self) -> torch.utils.data.DataLoader:
+        return torch.utils.data.DataLoader(dataset=self.train_set, shuffle=False, batch_size=self.hparams.data.batch_size,
+                                           drop_last=True)
+
+    def val_dataloader(self) -> torch.utils.data.DataLoader:
+        return torch.utils.data.DataLoader(dataset=self.val_set, shuffle=False, batch_size=self.hparams.data.batch_size,
+                                           drop_last=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.superglue.parameters(), lr=self.hparams.optimizer.learning_rate)
+        return optimizer
+
+    def training_step(self, batch, batch_ind):
+
+        for k in batch:
+            if k != 'file_name' and k != 'image0' and k != 'image1':
+                if type(batch[k]) == torch.Tensor:
+                    batch[k] = Variable(batch[k])
+                else:
+                    batch[k] = Variable(torch.stack(batch[k]))
+
+        data = self.superglue(batch)
+        for k, v in batch.items():
+            batch[k] = v[0]
+
+        batch = {**batch, **data}
+
+        if batch['skip_train']:  # image has no keypoint
+            return None
+
+        # process loss
+        self.log('train_loss', batch['loss'], on_epoch=False, on_step=True, sync_dist=True)
+        return batch
+
+    def validation_step(self, batch, batch_ind):
+
+        for k in batch:
+            if k != 'file_name' and k != 'image0' and k != 'image1':
+                if type(batch[k]) != torch.Tensor:
+                    batch[k] = torch.stack(batch[k])
+
+        data = self.superglue(batch)
+        for k, v in batch.items():
+            batch[k] = v[0]
+
+        batch = {**batch, **data}
+
+        if batch['skip_train']:  # image has no keypoint
+            return None
+
+        # process loss
+        self.log('val_loss', batch['loss'], on_epoch=True, on_step=False, sync_dist=True)
+        return batch
+
+    def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx) -> None:
+        pass
+        # if (self.trainer.global_step + 1) % 50 == 0 and len(outputs[0]) > 0:
+        #     outputs = outputs[0][0]['extra']
+        #     image0, image1 = outputs['image0'].cpu().numpy()[0] * 255., outputs['image1'].cpu().numpy()[0] * 255.
+        #     kpts0, kpts1 = outputs['keypoints0'][0].cpu().numpy(), outputs['keypoints1'][0].cpu().numpy()
+        #     matches, conf = outputs['matches0'].cpu().detach().numpy(), outputs['matching_scores0'].cpu().detach().numpy()
+        #     image0 = read_image_modified(image0, self.hparams.data.resize, self.hparams.data.resize_float)
+        #     image1 = read_image_modified(image1, self.hparams.data.resize, self.hparams.data.resize_float)
+        #     valid = matches > -1
+        #     mkpts0 = kpts0[valid]
+        #     mkpts1 = kpts1[matches[valid]]
+        #     mconf = conf[valid]
+        #     viz_path = self.hparams.data.eval_output_dir + \
+        #                f'{str(self.trainer.global_step)}_matches.{self.hparams.exp.viz_extension}'
+        #     color = cm.jet(mconf)
+        #     stem = outputs['file_name']
+        #     text = []
+        #
+        #     make_matching_plot(image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, viz_path, stem, stem,
+        #                        self.hparams.exp.show_keypoints, self.hparams.exp.fast_viz, self.hparams.exp.opencv_display,
+        #                        'Matches')
+
