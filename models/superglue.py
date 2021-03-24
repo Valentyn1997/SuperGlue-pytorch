@@ -50,39 +50,48 @@ from torch.autograd import Variable
 import matplotlib.cm as cm
 from os.path import abspath, dirname
 
-
-
 from load_data import SparseDataset
 from models.superpoint import SuperPoint
+from models.masked_bn import MaskedBatchNorm1d
 from models.utils import (compute_pose_error, compute_epipolar_error,
                           estimate_pose, make_matching_plot,
                           error_colormap, AverageTimer, pose_auc, read_image,
                           rotate_intrinsics, rotate_pose_inplane,
-                          scale_intrinsics, read_image_modified)
+                          scale_intrinsics, read_image_modified, masked_softmax)
 
 ROOT_PATH = dirname(dirname(abspath(__file__)))
 
 
-def MLP(channels: list, do_bn=True):
-    """ Multi-layer perceptron """
-    n = len(channels)
-    layers = []
-    for i in range(1, n):
-        layers.append(
-            nn.Conv1d(channels[i - 1], channels[i], kernel_size=1, bias=True))
-        if i < (n-1):
-            if do_bn:
-                layers.append(nn.BatchNorm1d(channels[i]))
-                # layers.append(nn.InstanceNorm1d(channels[i]))
-            layers.append(nn.ReLU())
-    return nn.Sequential(*layers)
+class MLP(nn.Module):
+    def __init__(self, channels: list, do_bn=True):
+        """ Multi-layer perceptron """
+        super().__init__()
+        n = len(channels)
+        layers = []
+        for i in range(1, n):
+            layers.append(
+                nn.Conv1d(channels[i - 1], channels[i], kernel_size=1, bias=True))
+            if i < (n - 1):
+                if do_bn:
+                    layers.append(MaskedBatchNorm1d(channels[i]))
+                layers.append(nn.ReLU())
+        self.layers = nn.ModuleList(layers).float()
+
+    def forward(self, input, input_mask=None):
+        x = input
+        for layer in self.layers:
+            if isinstance(layer, MaskedBatchNorm1d):
+                x = layer(x, input_mask=input_mask).float()
+            else:
+                x = layer(x)
+        return x
 
 
 def normalize_keypoints(kpts, image_shape):
     """ Normalize keypoints locations based on image image_shape"""
     _, _, height, width = image_shape
     one = kpts.new_tensor(1)
-    size = torch.stack([one*width, one*height])[None]
+    size = torch.stack([one * width, one * height])[None]
     center = size / 2
     scaling = size.max(1, keepdim=True).values * 0.7
     return (kpts - center[:, None, :]) / scaling[:, None, :]
@@ -90,26 +99,38 @@ def normalize_keypoints(kpts, image_shape):
 
 class KeypointEncoder(nn.Module):
     """ Joint encoding of visual appearance and location using MLPs"""
+
     def __init__(self, feature_dim, layers):
         super().__init__()
         self.encoder = MLP([3] + layers + [feature_dim])
-        nn.init.constant_(self.encoder[-1].bias, 0.0)
+        nn.init.constant_(self.encoder.layers[-1].bias, 0.0)
 
-    def forward(self, kpts, scores):
+    def forward(self, kpts, scores, mask):
         inputs = [kpts.transpose(1, 2), scores.unsqueeze(1)]
         inputs = torch.cat(inputs, dim=1)
-        return self.encoder(inputs)
+        return self.encoder(inputs, mask.unsqueeze(1))
 
 
-def attention(query, key, value):
+def attention(query, key, value, query_mask, key_value_mask):
     dim = query.shape[1]
-    scores = torch.einsum('bdhn,bdhm->bhnm', query, key) / dim**.5
-    prob = torch.nn.functional.softmax(scores, dim=-1)
+    scores = torch.einsum('bdhn,bdhm->bhnm', query, key) / dim ** .5
+
+    # key_value_mask = key_value_mask.clone().float()
+    # query_mask = query_mask.clone().float()
+    # key_value_mask = key_value_mask.masked_fill(key_value_mask == 0.0, -float('Inf'))
+    # query_mask = query_mask.masked_fill(query_mask == 0.0, -float('Inf'))
+
+    # * scores
+    # scores = scores.masked_fill(torch.isinf(scores), -float('Inf'))
+
+    prob = masked_softmax(scores, mask=key_value_mask.unsqueeze(1).unsqueeze(2) * query_mask.unsqueeze(1).unsqueeze(3), dim=-1)
+    # prob[prob.isnan()] = -10**6
     return torch.einsum('bhnm,bdhm->bdhn', prob, value), prob
 
 
 class MultiHeadedAttention(nn.Module):
     """ Multi-head attention to increase model expressivitiy """
+
     def __init__(self, num_heads: int, d_model: int):
         super().__init__()
         assert d_model % num_heads == 0
@@ -118,25 +139,25 @@ class MultiHeadedAttention(nn.Module):
         self.merge = nn.Conv1d(d_model, d_model, kernel_size=1)
         self.proj = nn.ModuleList([deepcopy(self.merge) for _ in range(3)])
 
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, query_mask, key_value_mask):
         batch_dim = query.size(0)
         query, key, value = [l(x).view(batch_dim, self.dim, self.num_heads, -1)
                              for l, x in zip(self.proj, (query, key, value))]
-        x, prob = attention(query, key, value)
+        x, prob = attention(query, key, value, query_mask, key_value_mask)
         self.prob.append(prob)
-        return self.merge(x.contiguous().view(batch_dim, self.dim*self.num_heads, -1))
+        return self.merge(x.contiguous().view(batch_dim, self.dim * self.num_heads, -1))
 
 
 class AttentionalPropagation(nn.Module):
     def __init__(self, feature_dim: int, num_heads: int):
         super().__init__()
         self.attn = MultiHeadedAttention(num_heads, feature_dim)
-        self.mlp = MLP([feature_dim*2, feature_dim*2, feature_dim])
-        nn.init.constant_(self.mlp[-1].bias, 0.0)
+        self.mlp = MLP([feature_dim * 2, feature_dim * 2, feature_dim])
+        nn.init.constant_(self.mlp.layers[-1].bias, 0.0)
 
-    def forward(self, x, source):
-        message = self.attn(x, source, source)
-        return self.mlp(torch.cat([x, message], dim=1))
+    def forward(self, x, source, x_mask, source_mask):
+        message = self.attn(x, source, source, x_mask, source_mask)
+        return self.mlp(torch.cat([x, message], dim=1), x_mask.unsqueeze(1))
 
 
 class AttentionalGNN(nn.Module):
@@ -147,14 +168,14 @@ class AttentionalGNN(nn.Module):
             for _ in range(len(layer_names))])
         self.names = layer_names
 
-    def forward(self, desc0, desc1):
+    def forward(self, desc0, desc1, mask0, mask1):
         for layer, name in zip(self.layers, self.names):
             layer.attn.prob = []
             if name == 'cross':
-                src0, src1 = desc1, desc0
+                src0, src1, src0_mask, src1_mask = desc1, desc0, mask1, mask0
             else:  # if name == 'self':
-                src0, src1 = desc0, desc1
-            delta0, delta1 = layer(desc0, src0), layer(desc1, src1)
+                src0, src1, src0_mask, src1_mask = desc0, desc1, mask0, mask1
+            delta0, delta1 = layer(desc0, src0, mask0, src0_mask), layer(desc1, src1, mask1, src1_mask)
             desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
         return desc0, desc1
 
@@ -164,30 +185,49 @@ def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
     u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
     for _ in range(iters):
         u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
+        u = u.masked_fill(u.isinf() | u.isnan(), -float('Inf'))
+        # assert u.isnan().any()
         v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
+        v = v.masked_fill(v.isinf() | v.isnan(), -float('Inf'))
+        # assert v.isnan().any()
     return Z + u.unsqueeze(2) + v.unsqueeze(1)
 
 
-def log_optimal_transport(scores, alpha, iters: int):
+def log_optimal_transport(scores, alpha, iters: int, mask_rows, mask_cols):
     """ Perform Differentiable Optimal Transport in Log-space for stability"""
     b, m, n = scores.shape
-    one = scores.new_tensor(1)
-    ms, ns = (m*one).to(scores), (n*one).to(scores)
+    # b, m, n = scores.shape[0], mask_rows.sum(1), mask_cols.sum(1)
 
-    bins0 = alpha.expand(b, m, 1)
-    bins1 = alpha.expand(b, 1, n)
+    scores = (mask_cols.unsqueeze(1) * mask_rows.unsqueeze(2) + 1e-45).log() + scores
+
+    one = scores.new_tensor(1)
+    # ms, ns = (m * one).to(scores), (n * one).to(scores)
+    ms, ns = (mask_rows.sum(1) * one).to(scores), (mask_cols.sum(1) * one).to(scores)
+
+    bins0 = torch.cat([torch.cat(
+        [alpha.expand(1, ms[i].int(), 1), torch.tensor(-float('Inf')).type_as(alpha).expand(1, (m - ms[i]).int(), 1)], 1) for i in
+                       range(ms.shape[0])], 0)
+    # bins0[mask_rows == 0.0] = torch.tensor(-float('Inf')).type_as(scores)
+    bins1 = torch.cat([torch.cat(
+        [alpha.expand(1, 1, ns[i].int()), torch.tensor(-float('Inf')).type_as(alpha).expand(1, 1, (n - ns[i]).int())], 2) for i in
+                       range(ns.shape[0])], 0)
+    # bins1[:, mask_cols == 0.0] = torch.tensor(-float('Inf')).type_as(scores)
     alpha = alpha.expand(b, 1, 1)
 
     couplings = torch.cat([torch.cat([scores, bins0], -1),
                            torch.cat([bins1, alpha], -1)], 1)
 
     norm = - (ms + ns).log()
-    log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
-    log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
-    log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
+    # log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
+    log_mu = torch.cat([norm.repeat(m, 1), (ns.log() + norm)[None]]).T
+    log_mu[:, :-1][mask_rows == 0.0] = torch.tensor(-float('Inf')).type_as(scores)
+    # log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
+    log_nu = torch.cat([norm.repeat(n, 1), (ms.log() + norm)[None]]).T
+    # log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
+    log_nu[:, :-1][mask_cols == 0.0] = torch.tensor(-float('Inf')).type_as(scores)
 
     Z = log_sinkhorn_iterations(couplings, log_mu, log_nu, iters)
-    Z = Z - norm  # multiply probabilities by M+N
+    Z = Z - norm.unsqueeze(-1).unsqueeze(-1)  # multiply probabilities by M+N
     return Z
 
 
@@ -246,50 +286,67 @@ class SuperGlue(nn.Module):
             # self.load_state_dict(SuperGlueLightning.load_from_checkpoint(path).superpoint.state_dict())
             print('Loaded SuperGlue model (\"{}\" weights)'.format(self.config['weights']))
 
+    @staticmethod
+    def _discard_empty(data):
+        mask = data['mask0']
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                data[k] = v[mask.sum(1) != 0.0]
+            else:
+                data[k] = [vv for (i, vv) in enumerate(v) if (mask.sum(1)[i] != 0.0)]
+        return data
+
+
     def forward(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
+
+        data = self._discard_empty(data)
+
         desc0, desc1 = data['descriptors0'].float(), data['descriptors1'].float()
         kpts0, kpts1 = data['keypoints0'].float(), data['keypoints1'].float()
-    
-        if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
-            shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
+        mask0, mask1 = data['mask0'], data['mask1']
+
+        if kpts0.shape[0] == 0 or kpts1.shape[0] == 0:  # no keypoints
+            # shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
             return {
-                'matches0': kpts0.new_full(shape0, -1, dtype=torch.int)[0],
-                'matches1': kpts1.new_full(shape1, -1, dtype=torch.int)[0],
-                'matching_scores0': kpts0.new_zeros(shape0)[0],
-                'matching_scores1': kpts1.new_zeros(shape1)[0],
+                # 'matches0': kpts0.new_full(shape0, -1, dtype=torch.int)[0],
+                # 'matches1': kpts1.new_full(shape1, -1, dtype=torch.int)[0],
+                # 'matching_scores0': kpts0.new_zeros(shape0)[0],
+                # 'matching_scores1': kpts1.new_zeros(shape1)[0],
                 'skip_train': True
             }
-        
+
         # Keypoint normalization.
         kpts0 = normalize_keypoints(kpts0, data['image0'].shape)
         kpts1 = normalize_keypoints(kpts1, data['image1'].shape)
 
         # Keypoint MLP encoder.
-        desc0 = desc0 + self.kenc(kpts0, data['scores0'].float())
-        desc1 = desc1 + self.kenc(kpts1, data['scores1'].float())
+        desc0 = desc0 + self.kenc(kpts0, data['scores0'].float(), mask0)
+        desc1 = desc1 + self.kenc(kpts1, data['scores1'].float(), mask1)
 
         # Multi-layer Transformer network.
-        desc0, desc1 = self.gnn(desc0, desc1)
+        desc0, desc1 = self.gnn(desc0, desc1, mask0, mask1)
 
         # Final MLP projection.
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
 
         # Compute matching descriptor distance.
         scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
-        scores = scores / self.config['descriptor_dim']**.5
+        scores = scores / self.config['descriptor_dim'] ** .5
 
         # Run the optimal transport.
-        scores = log_optimal_transport(
-            scores, self.bin_score,
-            iters=self.config['sinkhorn_iterations'])
+        log_scores = log_optimal_transport(scores, self.bin_score, iters=self.config['sinkhorn_iterations'],
+                                           mask_rows=mask0, mask_cols=mask1)
+
+        torch.testing.assert_allclose(mask0.sum(1) + mask1.sum(1),
+                                      log_scores.exp().masked_fill(log_scores.exp().isnan(), 0.0).sum((1, 2)))
 
         # Get the matches with score above "match_threshold".
-        max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+        max0, max1 = log_scores[:, :-1, :-1].max(2), log_scores[:, :-1, :-1].max(1)
         indices0, indices1 = max0.indices, max1.indices
         mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
         mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-        zero = scores.new_tensor(0)
+        zero = log_scores.new_tensor(0)
         mscores0 = torch.where(mutual0, max0.values.exp(), zero)
         mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
         valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
@@ -299,26 +356,37 @@ class SuperGlue(nn.Module):
 
         # check if indexed correctly
         if 'all_matches' in data:
-            loss = []
-            all_matches = data['all_matches']  # shape=torch.Size([1, 87, 2])
-            for i in range(len(all_matches[0])):
-                x = all_matches[0][i][0]
-                y = all_matches[0][i][1]
-                loss.append(-torch.log( scores[0][x][y].exp() )) # check batch size == 1 ?
+            all_matches = data['all_matches']
 
-            # for p0 in unmatched0:
-            #     loss += -torch.log(scores[0][p0][-1])
-            # for p1 in unmatched1:
-            #     loss += -torch.log(scores[0][-1][p1])
-            loss_mean = torch.mean(torch.stack(loss))
-            loss_mean = torch.reshape(loss_mean, (1, -1))
-            # scores big value or small value means confidence? log can't take neg value
+            # True Matches score
+            lossv2 = - log_scores[:, all_matches[:, :, 0]].diagonal(dim1=0, dim2=1).transpose(0, 2)
+            lossv2 = lossv2[:, all_matches[:, :, 1]].diagonal(dim1=0, dim2=1).diagonal(dim1=0, dim2=1)
+            lossv2 *= data['all_matches_mask']
+            # lossv2 = lossv2.sum(1)
+            n = data['all_matches_mask'].sum(1)
+            lossv2 = lossv2.sum(1) / n.masked_fill(n == 0.0, 1.0)
+
+            # Dustbin loss for unmatched points
+            non_ind_rows = [[ii for ii in range(mask0[b].sum().int()) if ii not in b_ix] for (b, b_ix) in
+                            enumerate(all_matches[:, :, 0])]
+            non_ind_cols = [[ii for ii in range(mask1[b].sum().int()) if ii not in b_ix] for (b, b_ix) in
+                            enumerate(all_matches[:, :, 1])]
+            nr = (mask0.sum(1) - data['all_matches_mask'].sum(1))
+            nc = (mask1.sum(1) - data['all_matches_mask'].sum(1))
+            lossv2 -= torch.stack([log_scores[b, non_ind_rows[b], -1].sum() for b in range(log_scores.shape[0])]) \
+                      / nr.masked_fill(nr == 0.0, 1.0)
+            lossv2 -= torch.stack([log_scores[b, -1, non_ind_cols[b]].sum() for b in range(log_scores.shape[0])]) \
+                      / nc.masked_fill(nc == 0.0, 1.0)
+
+            # Masking empty images
+            assert not lossv2.isnan().any()
+
             return {
-                'matches0': indices0[0], # use -1 for invalid match
-                'matches1': indices1[0], # use -1 for invalid match
+                'matches0': indices0[0],  # use -1 for invalid match
+                'matches1': indices1[0],  # use -1 for invalid match
                 'matching_scores0': mscores0[0],
                 'matching_scores1': mscores1[0],
-                'loss': loss_mean[0],
+                'loss': lossv2.mean(),
                 'skip_train': False
             }
         else:
@@ -330,7 +398,6 @@ class SuperGlue(nn.Module):
                 'loss': None,
                 'skip_train': True
             }
-
 
 
 class SuperGlueLightning(LightningModule):
@@ -358,11 +425,13 @@ class SuperGlueLightning(LightningModule):
                                        self.hparams.model.superpoint.max_keypoints,
                                        self.hparams.data.resize,
                                        self.hparams.data.resize_float,
+                                       self.hparams.model.superglue.min_keypoints,
                                        self.superpoint)
         self.val_set = SparseDataset(f'{ROOT_PATH}/' + self.hparams.data.val_path,
                                      self.hparams.model.superpoint.max_keypoints,
                                      self.hparams.data.resize,
                                      self.hparams.data.resize_float,
+                                     self.hparams.model.superglue.min_keypoints,
                                      self.superpoint)
         self.val_set.files = self.val_set.files[:self.hparams.data.val_size]
 
@@ -388,8 +457,8 @@ class SuperGlueLightning(LightningModule):
                     batch[k] = Variable(torch.stack(batch[k]))
 
         data = self.superglue(batch)
-        for k, v in batch.items():
-            batch[k] = v[0]
+        # for k, v in batch.items():
+        #     batch[k] = v[0]
 
         batch = {**batch, **data}
 
@@ -398,7 +467,7 @@ class SuperGlueLightning(LightningModule):
 
         # process loss
         self.log('train_loss', batch['loss'], on_epoch=False, on_step=True, sync_dist=True)
-        return batch
+        return batch['loss']
 
     def validation_step(self, batch, batch_ind):
 
@@ -408,8 +477,8 @@ class SuperGlueLightning(LightningModule):
                     batch[k] = torch.stack(batch[k])
 
         data = self.superglue(batch)
-        for k, v in batch.items():
-            batch[k] = v[0]
+        # for k, v in batch.items():
+        #     batch[k] = v[0]
 
         batch = {**batch, **data}
 
@@ -418,7 +487,7 @@ class SuperGlueLightning(LightningModule):
 
         # process loss
         self.log('val_loss', batch['loss'], on_epoch=True, on_step=False, sync_dist=True)
-        return batch
+        return batch['loss']
 
     def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx) -> None:
         pass
@@ -442,4 +511,3 @@ class SuperGlueLightning(LightningModule):
         #     make_matching_plot(image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, viz_path, stem, stem,
         #                        self.hparams.exp.show_keypoints, self.hparams.exp.fast_viz, self.hparams.exp.opencv_display,
         #                        'Matches')
-

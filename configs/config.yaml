@@ -3,7 +3,7 @@ data:
   eval_output_dir: dump_match_pairs/  # Path to the directory in which the .npz results and optional, visualizations are written
   eval_pairs_list: assets/scannet_sample_pairs_with_gt.txt  # Path to the list of image pairs for evaluation
   shuffle: True  # Shuffle ordering of pairs before processing
-  batch_size: 4
+  batch_size: 8
   train_path: data/COCO2014/train2014/   # Path to the directory of training imgs
   val_path: data/COCO2014/val2014/   # Path to the directory of training imgs
   val_size: 1000
@@ -12,7 +12,7 @@ data:
   resize_float: True  # Resize the image after casting uint8 to float
 
 optimizer:
-  learning_rate: 0.001  # Learning rate
+  learning_rate: 0.0002  # Learning rate
 
 exp:
   viz: True  #  Visualize the matches and dump the plots
@@ -33,11 +33,12 @@ model:
   superglue:
     weights:
     match_threshold: 0.2  # SuperGlue match threshold
+    min_keypoints: 2
     sinkhorn_iterations: 50  # Number of Sinkhorn iterations performed by SuperGlue
   superpoint:
     nms_radius: 4  # SuperPoint Non Maximum Suppression (NMS) radius (Must be positive)
     keypoint_threshold: 0.005  # SuperPoint keypoint detector confidence threshold
-    max_keypoints: 1024  # Maximum number of keypoints detected by Superpoint ('-1' keeps all keypoints)
+    max_keypoints: 512  # Maximum number of keypoints detected by Superpoint ('-1' keeps all keypoints)
 
 # Hydra defaults
 defaults:

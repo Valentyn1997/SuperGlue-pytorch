@@ -17,17 +17,19 @@ np.random.seed(42)
 class SparseDataset(Dataset):
     """Sparse correspondences dataset."""
 
-    def __init__(self, train_path, nfeatures, resize, resize_float, detector='sift'):
+    def __init__(self, train_path, nfeatures, resize, resize_float, min_keypoints, detector='sift'):
 
         self.files = []
         self.files += [train_path + f for f in os.listdir(train_path)]
 
         self.nfeatures = nfeatures
+        self.min_keypoints = min_keypoints
         self.resize = resize
         self.resize_float = resize_float
         # detector = 'sift'
         if detector == 'sift':
             sift = cv2.xfeatures2d.SIFT_create(nfeatures=self.nfeatures)
+            self.desc_dim = 128
 
             def detect(img):
 
@@ -43,6 +45,8 @@ class SparseDataset(Dataset):
 
             self.detect = detect
         elif isinstance(detector, SuperPoint):
+            self.desc_dim = detector.config['descriptor_dim']
+
             def detect(img):
                 with torch.no_grad():
                     result = detector({'image': frame2tensor(img.astype('float32'))})
@@ -77,8 +81,6 @@ class SparseDataset(Dataset):
         else:
             image = cv2.resize(image, (w_new, h_new)).astype('float32')
 
-
-
         width, height = image.shape[:2]
         corners = np.array([[0, 0], [0, height], [width, 0], [width, height]], dtype=np.float32)
 
@@ -96,13 +98,22 @@ class SparseDataset(Dataset):
         kp1_np, descs1, scores1_np = self.detect(image)
         kp2_np, descs2, scores2_np = self.detect(warped)
 
+        image = torch.from_numpy(image / 255.)[None].cuda().float()
+        warped = torch.from_numpy(warped / 255.)[None].cuda().float()
+
         # skip this image pair if no keypoints detected in image
-        if len(kp1_np) < 2 or len(kp2_np) < 2:
-            return{
-                'keypoints0': torch.zeros([0, 0, 2]),
-                'keypoints1': torch.zeros([0, 0, 2]),
-                'descriptors0': torch.zeros([0, 2]),
-                'descriptors1': torch.zeros([0, 2]),
+        if len(kp1_np) < self.min_keypoints or len(kp2_np) < self.min_keypoints:
+            return {
+                'keypoints0': np.zeros([self.nfeatures, 2]),
+                'keypoints1': np.zeros([self.nfeatures, 2]),
+                'descriptors0': np.zeros([self.desc_dim, self.nfeatures]),
+                'descriptors1': np.zeros([self.desc_dim, self.nfeatures]),
+                'scores0': np.zeros([self.nfeatures, ]),
+                'scores1': np.zeros([self.nfeatures, ]),
+                'mask0': np.zeros([self.nfeatures, ]),
+                'mask1': np.zeros([self.nfeatures, ]),
+                'all_matches': np.zeros([self.nfeatures, 2], dtype=int),
+                'all_matches_mask': np.zeros([self.nfeatures, ]),
                 'image0': image,
                 'image1': warped,
                 'file_name': file_name
@@ -141,22 +152,25 @@ class SparseDataset(Dataset):
         # descs1 = np.pad((descs1 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
         # descs2 = np.pad((descs2 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
 
-        image = torch.from_numpy(image/255.)[None].cuda().float()
-        warped = torch.from_numpy(warped/255.)[None].cuda().float()
+
 
 
         # Padding
-        kp1_np, mask1 = self._pad_and_mask(kp1_np, axis=0, val=np.nan)
-        kp2_np, mask2 = self._pad_and_mask(kp2_np, axis=0, val=np.nan)
-        descs1, _ = self._pad_and_mask(descs1, axis=1, val=np.nan)
-        descs2, _ = self._pad_and_mask(descs2, axis=1, val=np.nan)
+        pad_value = - 10**6
+        # self.nfeatures = self.nfeatures + 1
+        kp1_np, mask1 = self._pad_and_mask(kp1_np, axis=0, val=pad_value)
+        kp2_np, mask2 = self._pad_and_mask(kp2_np, axis=0, val=pad_value)
+        descs1, _ = self._pad_and_mask(descs1, axis=1, val=pad_value)
+        descs2, _ = self._pad_and_mask(descs2, axis=1, val=pad_value)
         scores1_np = np.pad(scores1_np, pad_width=((0, self.nfeatures - scores1_np.shape[0]), ), mode='constant',
-                            constant_values=np.nan)
+                            constant_values=pad_value)
         scores2_np = np.pad(scores2_np, pad_width=((0, self.nfeatures - scores2_np.shape[0]),), mode='constant',
-                            constant_values=np.nan)
+                            constant_values=pad_value)
         all_matches, all_matches_mask = self._pad_and_mask(all_matches, axis=0, val=0)
 
-        return{
+        # self.nfeatures = self.nfeatures - 1
+
+        return {
             'keypoints0': kp1_np,
             'keypoints1': kp2_np,
             'descriptors0': descs1,
@@ -164,7 +178,7 @@ class SparseDataset(Dataset):
             'scores0': scores1_np,
             'scores1': scores2_np,
             'mask0': mask1,
-            'mask2': mask2,
+            'mask1': mask2,
             'image0': image,
             'image1': warped,
             'all_matches': all_matches,

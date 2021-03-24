@@ -119,6 +119,8 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 @hydra.main(config_path='configs', config_name='config.yaml')
 def main(args: DictConfig):
+    # torch.autograd.set_detect_anomaly(True)
+
     model = SuperGlueLightning(args)
     mlf_logger = MLFlowLogger(experiment_name='SuperGlue', tracking_uri=args.exp.mlflow_uri)
     mlf_logger.experiment.log_param(mlf_logger.run_id, 'chekpoints_path', f'{os.getcwd()}/{args.exp.checkpoint_path}')
@@ -130,7 +132,9 @@ def main(args: DictConfig):
                       accumulate_grad_batches=args.exp.accumulate_grad_batches,
                       checkpoint_callback=checkpoint_callback if args.exp.checkpoint else None,
                       val_check_interval=0.01,
-                      log_every_n_steps=100)
+                      log_every_n_steps=100,
+                      num_sanity_val_steps=0,
+                      )
 
     trainer.fit(model)
 
