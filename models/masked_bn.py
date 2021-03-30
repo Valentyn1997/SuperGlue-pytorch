@@ -28,7 +28,7 @@ class MaskedBatchNorm1d(nn.BatchNorm1d):
     """
 
     def __init__(self, num_features, eps=1e-5, momentum=0.1,
-                 affine=True, track_running_stats=True):
+                 affine=True, track_running_stats=False):
         super(MaskedBatchNorm1d, self).__init__(num_features, eps, momentum, affine, track_running_stats)
 
     def forward(self, input, input_mask=None):
@@ -50,16 +50,29 @@ class MaskedBatchNorm1d(nn.BatchNorm1d):
         current_mean = masked_sum / n
         current_var = ((masked - current_mean) ** 2).sum(dim=0, keepdim=True).sum(dim=2, keepdim=True) / n
         # Update running stats
+
         if self.track_running_stats and self.training:
             if self.num_batches_tracked == 0:
                 self.running_mean = current_mean
                 self.running_var = current_var
             else:
+                if len(self.running_mean.shape) == 1:  # Problems with multi-GPU sharing
+                    self.running_mean = self.running_mean.unsqueeze(0).unsqueeze(-1)
+                    self.running_var = self.running_var.unsqueeze(0).unsqueeze(-1)
+
                 self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * current_mean
                 self.running_var = (1 - self.momentum) * self.running_var + self.momentum * current_var
+
+                # print(self.running_mean.shape)
+                self.running_mean = self.running_mean.squeeze()
+                self.running_var = self.running_var.squeeze()
+
             self.num_batches_tracked += 1
-        # Norm the input
+        # Norm the inputPY
         if self.track_running_stats and not self.training:
+            if len(self.running_mean.shape) == 1:  # Problems with multi-GPU sharing
+                self.running_mean = self.running_mean.unsqueeze(0).unsqueeze(-1)
+                self.running_var = self.running_var.unsqueeze(0).unsqueeze(-1)
             normed = (masked - self.running_mean) / (torch.sqrt(self.running_var + self.eps))
         else:
             normed = (masked - current_mean) / (torch.sqrt(current_var + self.eps))

@@ -131,7 +131,9 @@ def main(args: DictConfig):
                       max_epochs=args.exp.epochs,
                       accumulate_grad_batches=args.exp.accumulate_grad_batches,
                       checkpoint_callback=checkpoint_callback if args.exp.checkpoint else None,
-                      val_check_interval=0.01,
+                      val_check_interval=0.1,
+                      # limit_val_batches=args.data.val_size,
+                      accelerator='dp',
                       log_every_n_steps=100,
                       num_sanity_val_steps=0,
                       )

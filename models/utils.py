@@ -257,7 +257,7 @@ def process_resize(w, h, resize):
 
 
 def frame2tensor(frame):
-    return torch.from_numpy(frame/255.).float()[None, None].cuda()
+    return torch.from_numpy(frame/255.).float()[None, None]
 
 
 def read_image(path, resize, rotation, resize_float):
@@ -587,3 +587,25 @@ def masked_softmax(vector: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> t
         # becomes 0 - this is just the smallest value we can actually use.
         vector = vector + (mask + 1e-45).log()
     return torch.nn.functional.softmax(vector, dim=dim)
+
+
+def hits_at_one(batch):
+    d = {k: v.detach() for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+    gt_matches, gt_conf = d['all_matches'], d['all_matches_mask']
+    gt_valid = gt_conf > 0.0
+
+    matches, conf = d['matches0'], d['matching_scores0']
+    est_matches = torch.stack([torch.arange(0, matches.shape[1]).repeat(matches.shape[0], 1).type_as(matches), matches], 1)
+    est_matches = est_matches.transpose(2, 1)
+
+    assert est_matches.shape == gt_matches.shape
+
+    valid = (matches > 0.0)
+
+    acc = []
+    for b, (est_m, gt_m) in enumerate(zip(est_matches, gt_matches)):
+        if len(gt_m[gt_valid[b]]) > 0:
+            acc.append(len([m for m in est_m[valid[b]] if m in gt_m[gt_valid[b]]]) / len(gt_m[gt_valid[b]]))
+
+    return torch.tensor(acc).type_as(conf)

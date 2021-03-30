@@ -53,7 +53,7 @@ from os.path import abspath, dirname
 from load_data import SparseDataset
 from models.superpoint import SuperPoint
 from models.masked_bn import MaskedBatchNorm1d
-from models.utils import (compute_pose_error, compute_epipolar_error,
+from models.utils import (compute_pose_error, compute_epipolar_error, hits_at_one,
                           estimate_pose, make_matching_plot,
                           error_colormap, AverageTimer, pose_auc, read_image,
                           rotate_intrinsics, rotate_pose_inplane,
@@ -280,20 +280,24 @@ class SuperGlue(nn.Module):
             path = Path(__file__).parent.parent
             path = path / self.config['weights']
 
-            state_dict = {k.replace('superglue.', ''): v for k, v in torch.load(path)['state_dict'].items()
-                          if 'superpoint' not in k}
+            model = torch.load(path, map_location=torch.device('cpu'))
+            if 'state_dict' in model:
+                state_dict = {k.replace('superglue.', ''): v for k, v in model['state_dict'].items() if 'superpoint' not in k}
+            else:
+                state_dict = model
             self.load_state_dict(state_dict)
             # self.load_state_dict(SuperGlueLightning.load_from_checkpoint(path).superpoint.state_dict())
             print('Loaded SuperGlue model (\"{}\" weights)'.format(self.config['weights']))
 
-    @staticmethod
-    def _discard_empty(data):
+    def _discard_empty(self, data):
         mask = data['mask0']
         for k, v in data.items():
             if isinstance(v, torch.Tensor):
                 data[k] = v[mask.sum(1) != 0.0]
             else:
-                data[k] = [vv for (i, vv) in enumerate(v) if (mask.sum(1)[i] != 0.0)]
+                # print(len(v), len(mask.sum(1)))
+                pass
+                # data[k] = [vv for (i, vv) in enumerate(v) if (mask.sum(1)[i] != 0.0)]
         return data
 
 
@@ -359,42 +363,47 @@ class SuperGlue(nn.Module):
             all_matches = data['all_matches']
 
             # True Matches score
-            lossv2 = - log_scores[:, all_matches[:, :, 0]].diagonal(dim1=0, dim2=1).transpose(0, 2)
-            lossv2 = lossv2[:, all_matches[:, :, 1]].diagonal(dim1=0, dim2=1).diagonal(dim1=0, dim2=1)
-            lossv2 *= data['all_matches_mask']
+            loss_m = - log_scores[:, all_matches[:, :, 0]].diagonal(dim1=0, dim2=1).transpose(0, 2)
+            loss_m = loss_m[:, all_matches[:, :, 1]].diagonal(dim1=0, dim2=1).diagonal(dim1=0, dim2=1)
+            loss_m *= data['all_matches_mask']
             # lossv2 = lossv2.sum(1)
             n = data['all_matches_mask'].sum(1)
-            lossv2 = lossv2.sum(1) / n.masked_fill(n == 0.0, 1.0)
+            loss_m = loss_m.sum(1) / n.masked_fill(n == 0.0, 1.0)
 
             # Dustbin loss for unmatched points
-            non_ind_rows = [[ii for ii in range(mask0[b].sum().int()) if ii not in b_ix] for (b, b_ix) in
+            non_ind_rows = [[ii for ii in range(mask0[b].sum().int()) if ii not in b_ix[data['all_matches_mask'][b].bool()]] for (b, b_ix) in
                             enumerate(all_matches[:, :, 0])]
-            non_ind_cols = [[ii for ii in range(mask1[b].sum().int()) if ii not in b_ix] for (b, b_ix) in
+            non_ind_cols = [[ii for ii in range(mask1[b].sum().int()) if ii not in b_ix[data['all_matches_mask'][b].bool()]] for (b, b_ix) in
                             enumerate(all_matches[:, :, 1])]
             nr = (mask0.sum(1) - data['all_matches_mask'].sum(1))
             nc = (mask1.sum(1) - data['all_matches_mask'].sum(1))
-            lossv2 -= torch.stack([log_scores[b, non_ind_rows[b], -1].sum() for b in range(log_scores.shape[0])]) \
+            loss_um = - torch.stack([log_scores[b, non_ind_rows[b], -1].sum() for b in range(log_scores.shape[0])]) \
                       / nr.masked_fill(nr == 0.0, 1.0)
-            lossv2 -= torch.stack([log_scores[b, -1, non_ind_cols[b]].sum() for b in range(log_scores.shape[0])]) \
+            loss_um -= torch.stack([log_scores[b, -1, non_ind_cols[b]].sum() for b in range(log_scores.shape[0])]) \
                       / nc.masked_fill(nc == 0.0, 1.0)
 
             # Masking empty images
-            assert not lossv2.isnan().any()
+            assert not loss_m.isnan().any()
+            assert not loss_um.isnan().any()
 
             return {
-                'matches0': indices0[0],  # use -1 for invalid match
-                'matches1': indices1[0],  # use -1 for invalid match
-                'matching_scores0': mscores0[0],
-                'matching_scores1': mscores1[0],
-                'loss': lossv2.mean(),
+                'matches0': indices0,  # use -1 for invalid match
+                'matches1': indices1,  # use -1 for invalid match
+                'matching_scores0': mscores0,
+                'matching_scores1': mscores1,
+                'loss_m': loss_m.mean(),
+                'loss_um': loss_um.mean(),
+                'loss': loss_m.mean() + loss_um.mean(),
                 'skip_train': False
             }
         else:
             return {
-                'matches0': indices0[0],  # use -1 for invalid match
-                'matches1': indices1[0],  # use -1 for invalid match
-                'matching_scores0': mscores0[0],
-                'matching_scores1': mscores1[0],
+                'matches0': indices0,  # use -1 for invalid match
+                'matches1': indices1,  # use -1 for invalid match
+                'matching_scores0': mscores0,
+                'matching_scores1': mscores1,
+                'loss_m': None,
+                'loss_um': None,
                 'loss': None,
                 'skip_train': True
             }
@@ -433,14 +442,15 @@ class SuperGlueLightning(LightningModule):
                                      self.hparams.data.resize_float,
                                      self.hparams.model.superglue.min_keypoints,
                                      self.superpoint)
+        self.train_set.files = self.train_set.files[:self.hparams.data.train_size]
         self.val_set.files = self.val_set.files[:self.hparams.data.val_size]
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:
-        return torch.utils.data.DataLoader(dataset=self.train_set, shuffle=False, batch_size=self.hparams.data.batch_size,
+        return torch.utils.data.DataLoader(dataset=self.train_set, shuffle=True, batch_size=self.hparams.data.batch_size.train,
                                            drop_last=True)
 
     def val_dataloader(self) -> torch.utils.data.DataLoader:
-        return torch.utils.data.DataLoader(dataset=self.val_set, shuffle=False, batch_size=self.hparams.data.batch_size,
+        return torch.utils.data.DataLoader(dataset=self.val_set, shuffle=True, batch_size=self.hparams.data.batch_size.val,
                                            drop_last=True)
 
     def configure_optimizers(self):
@@ -457,15 +467,15 @@ class SuperGlueLightning(LightningModule):
                     batch[k] = Variable(torch.stack(batch[k]))
 
         data = self.superglue(batch)
-        # for k, v in batch.items():
-        #     batch[k] = v[0]
-
         batch = {**batch, **data}
 
         if batch['skip_train']:  # image has no keypoint
             return None
 
-        # process loss
+        # Loss & Metrics
+        self.log('train_hits_1', hits_at_one(batch).mean(), on_epoch=False, on_step=True, sync_dist=True)
+        self.log('train_loss_m', batch['loss_m'], on_epoch=False, on_step=True, sync_dist=True)
+        self.log('train_loss_um', batch['loss_um'], on_epoch=False, on_step=True, sync_dist=True)
         self.log('train_loss', batch['loss'], on_epoch=False, on_step=True, sync_dist=True)
         return batch['loss']
 
@@ -477,16 +487,16 @@ class SuperGlueLightning(LightningModule):
                     batch[k] = torch.stack(batch[k])
 
         data = self.superglue(batch)
-        # for k, v in batch.items():
-        #     batch[k] = v[0]
-
         batch = {**batch, **data}
 
         if batch['skip_train']:  # image has no keypoint
             return None
 
-        # process loss
+        # Loss & Metrics
+        self.log('val_hits_1', hits_at_one(batch).mean(), on_epoch=True, on_step=False, sync_dist=True)
         self.log('val_loss', batch['loss'], on_epoch=True, on_step=False, sync_dist=True)
+        self.log('val_loss_m', batch['loss_m'], on_epoch=True, on_step=False, sync_dist=True)
+        self.log('val_loss_um', batch['loss_um'], on_epoch=True, on_step=False, sync_dist=True)
         return batch['loss']
 
     def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx) -> None:

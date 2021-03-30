@@ -14,6 +14,41 @@ from models.utils import frame2tensor, process_resize
 np.random.seed(42)
 
 
+class Detector:
+
+    def detect(self, img):
+        raise NotImplementedError()
+
+
+class SIFTDetector (Detector):
+    def __init__(self, nfeatures):
+        self.nfeatures = nfeatures
+        self.sift = cv2.xfeatures2d.SIFT_create(nfeatures=nfeatures)
+
+    def detect(self, img):
+        kp, descs = self.sift.detectAndCompute(img, None)
+        kp_num = min(self.nfeatures, len(kp))
+        kp = kp[:kp_num]
+        if descs is not None:
+            descs = descs[:kp_num, :]
+
+        kp_np = np.array([(k.pt[0], k.pt[1]) for k in kp])
+        scores_np = np.array([k.response for k in kp])
+        return kp_np, descs, scores_np
+
+
+class SuperPointDetector(Detector):
+    def __init__(self, detector: SuperPoint):
+        self.detector = detector.cpu()
+
+    def detect(self, img):
+        with torch.no_grad():
+            result = self.detector({'image': frame2tensor(img.astype('float32')).cuda()})
+        return result['keypoints'][0].cpu().float().numpy(), \
+               result['descriptors'][0].cpu().float().numpy(), \
+               result['scores'][0].cpu().float().numpy()
+
+
 class SparseDataset(Dataset):
     """Sparse correspondences dataset."""
 
@@ -26,35 +61,13 @@ class SparseDataset(Dataset):
         self.min_keypoints = min_keypoints
         self.resize = resize
         self.resize_float = resize_float
-        # detector = 'sift'
+
         if detector == 'sift':
-            sift = cv2.xfeatures2d.SIFT_create(nfeatures=self.nfeatures)
             self.desc_dim = 128
-
-            def detect(img):
-
-                kp, descs = sift.detectAndCompute(img, None)
-                kp_num = min(self.nfeatures, len(kp))
-                kp = kp[:kp_num]
-                if descs is not None:
-                    descs = descs[:kp_num, :]
-
-                kp_np = np.array([(k.pt[0], k.pt[1]) for k in kp])
-                scores_np = np.array([k.response for k in kp])
-                return kp_np, descs, scores_np
-
-            self.detect = detect
+            self.detector = SIFTDetector(self.nfeatures)
         elif isinstance(detector, SuperPoint):
             self.desc_dim = detector.config['descriptor_dim']
-
-            def detect(img):
-                with torch.no_grad():
-                    result = detector({'image': frame2tensor(img.astype('float32'))})
-                return result['keypoints'][0].cpu().float().numpy(), \
-                       result['descriptors'][0].cpu().float().numpy(), \
-                       result['scores'][0].cpu().float().numpy()
-            self.detect = detect
-        # self.matcher = cv2.BFMatcher_create(cv2.NORM_L1, crossCheck=False)
+            self.detector = SuperPointDetector(detector)
 
     def __len__(self):
         return len(self.files)
@@ -67,7 +80,6 @@ class SparseDataset(Dataset):
             new_arr = np.pad(arr, pad_width=((0, 0), (0, self.nfeatures - arr.shape[1])), mode='constant', constant_values=val)
             mask = np.array([1.0] * arr.shape[1] + [0.0] * (self.nfeatures - arr.shape[1]))
         return new_arr, mask
-
 
     def __getitem__(self, idx):
         file_name = self.files[idx]
@@ -86,20 +98,18 @@ class SparseDataset(Dataset):
 
         kp1, kp2, all_matches = [], [], []
 
-        # while len(kp1) < 2 or len(kp2) < 2 or len(all_matches) < 2:
-
         warp = np.random.randint(-224, 224, size=(4, 2)).astype(np.float32)
 
         # get the corresponding warped image
         M = cv2.getPerspectiveTransform(corners, corners + warp)
-        warped = cv2.warpPerspective(src=image, M=M, dsize=(image.shape[1], image.shape[0])) # return an image type
+        warped = cv2.warpPerspective(src=image, M=M, dsize=(image.shape[1], image.shape[0]))  # return an image type
 
         # extract keypoints of the image pair using SIFT
-        kp1_np, descs1, scores1_np = self.detect(image)
-        kp2_np, descs2, scores2_np = self.detect(warped)
+        kp1_np, descs1, scores1_np = self.detector.detect(image)
+        kp2_np, descs2, scores2_np = self.detector.detect(warped)
 
-        image = torch.from_numpy(image / 255.)[None].cuda().float()
-        warped = torch.from_numpy(warped / 255.)[None].cuda().float()
+        image = torch.from_numpy(image / 255.)[None].float()
+        warped = torch.from_numpy(warped / 255.)[None].float()
 
         # skip this image pair if no keypoints detected in image
         if len(kp1_np) < self.min_keypoints or len(kp2_np) < self.min_keypoints:
@@ -152,23 +162,17 @@ class SparseDataset(Dataset):
         # descs1 = np.pad((descs1 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
         # descs2 = np.pad((descs2 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
 
-
-
-
         # Padding
-        pad_value = - 10**6
-        # self.nfeatures = self.nfeatures + 1
+        pad_value = - 10 ** 6
         kp1_np, mask1 = self._pad_and_mask(kp1_np, axis=0, val=pad_value)
         kp2_np, mask2 = self._pad_and_mask(kp2_np, axis=0, val=pad_value)
         descs1, _ = self._pad_and_mask(descs1, axis=1, val=pad_value)
         descs2, _ = self._pad_and_mask(descs2, axis=1, val=pad_value)
-        scores1_np = np.pad(scores1_np, pad_width=((0, self.nfeatures - scores1_np.shape[0]), ), mode='constant',
+        scores1_np = np.pad(scores1_np, pad_width=((0, self.nfeatures - scores1_np.shape[0]),), mode='constant',
                             constant_values=pad_value)
         scores2_np = np.pad(scores2_np, pad_width=((0, self.nfeatures - scores2_np.shape[0]),), mode='constant',
                             constant_values=pad_value)
         all_matches, all_matches_mask = self._pad_and_mask(all_matches, axis=0, val=0)
-
-        # self.nfeatures = self.nfeatures - 1
 
         return {
             'keypoints0': kp1_np,
@@ -185,4 +189,3 @@ class SparseDataset(Dataset):
             'all_matches_mask': all_matches_mask,
             'file_name': file_name
         }
-
