@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import init
 
 
-class MaskedBatchNorm1d(nn.BatchNorm1d):
+class MaskedBatchNorm1d(nn.SyncBatchNorm):
     """ A masked version of nn.BatchNorm1d. Only tested for 3D inputs.
 
         Args:
@@ -28,7 +28,7 @@ class MaskedBatchNorm1d(nn.BatchNorm1d):
     """
 
     def __init__(self, num_features, eps=1e-5, momentum=0.1,
-                 affine=True, track_running_stats=False):
+                 affine=True, track_running_stats=True):
         super(MaskedBatchNorm1d, self).__init__(num_features, eps, momentum, affine, track_running_stats)
 
     def forward(self, input, input_mask=None):
@@ -70,10 +70,14 @@ class MaskedBatchNorm1d(nn.BatchNorm1d):
             self.num_batches_tracked += 1
         # Norm the inputPY
         if self.track_running_stats and not self.training:
+            # print(self.running_mean.shape)
             if len(self.running_mean.shape) == 1:  # Problems with multi-GPU sharing
                 self.running_mean = self.running_mean.unsqueeze(0).unsqueeze(-1)
                 self.running_var = self.running_var.unsqueeze(0).unsqueeze(-1)
             normed = (masked - self.running_mean) / (torch.sqrt(self.running_var + self.eps))
+
+            self.running_mean = self.running_mean.squeeze()
+            self.running_var = self.running_var.squeeze()
         else:
             normed = (masked - current_mean) / (torch.sqrt(current_var + self.eps))
         # Apply affine parameters

@@ -266,7 +266,8 @@ class SuperGlue(nn.Module):
         super().__init__()
         self.config = {**self.default_config, **config}
 
-        self.kenc = KeypointEncoder(self.config['descriptor_dim'], self.config['keypoint_encoder'])
+        self.kenc0 = KeypointEncoder(self.config['descriptor_dim'], self.config['keypoint_encoder'])
+        # self.kenc1 = KeypointEncoder(self.config['descriptor_dim'], self.config['keypoint_encoder'])
 
         self.gnn = AttentionalGNN(self.config['descriptor_dim'], self.config['GNN_layers'])
 
@@ -325,8 +326,8 @@ class SuperGlue(nn.Module):
         kpts1 = normalize_keypoints(kpts1, data['image1'].shape)
 
         # Keypoint MLP encoder.
-        desc0 = desc0 + self.kenc(kpts0, data['scores0'].float(), mask0)
-        desc1 = desc1 + self.kenc(kpts1, data['scores1'].float(), mask1)
+        desc0 = desc0 + self.kenc0(kpts0, data['scores0'].float(), mask0)
+        desc1 = desc1 + self.kenc0(kpts1, data['scores1'].float(), mask1)
 
         # Multi-layer Transformer network.
         desc0, desc1 = self.gnn(desc0, desc1, mask0, mask1)
@@ -368,7 +369,7 @@ class SuperGlue(nn.Module):
             loss_m *= data['all_matches_mask']
             # lossv2 = lossv2.sum(1)
             n = data['all_matches_mask'].sum(1)
-            loss_m = loss_m.sum(1) / n.masked_fill(n == 0.0, 1.0)
+            loss_m = loss_m.sum(1) #/ n.masked_fill(n == 0.0, 1.0)
 
             # Dustbin loss for unmatched points
             non_ind_rows = [[ii for ii in range(mask0[b].sum().int()) if ii not in b_ix[data['all_matches_mask'][b].bool()]] for (b, b_ix) in
@@ -377,10 +378,10 @@ class SuperGlue(nn.Module):
                             enumerate(all_matches[:, :, 1])]
             nr = (mask0.sum(1) - data['all_matches_mask'].sum(1))
             nc = (mask1.sum(1) - data['all_matches_mask'].sum(1))
-            loss_um = - torch.stack([log_scores[b, non_ind_rows[b], -1].sum() for b in range(log_scores.shape[0])]) \
-                      / nr.masked_fill(nr == 0.0, 1.0)
-            loss_um -= torch.stack([log_scores[b, -1, non_ind_cols[b]].sum() for b in range(log_scores.shape[0])]) \
-                      / nc.masked_fill(nc == 0.0, 1.0)
+            loss_um = - torch.stack([log_scores[b, non_ind_rows[b], -1].sum() for b in range(log_scores.shape[0])])
+                      # / nr.masked_fill(nr == 0.0, 1.0)
+            loss_um -= torch.stack([log_scores[b, -1, non_ind_cols[b]].sum() for b in range(log_scores.shape[0])])
+                      # / nc.masked_fill(nc == 0.0, 1.0)
 
             # Masking empty images
             assert not loss_m.isnan().any()
@@ -428,6 +429,7 @@ class SuperGlueLightning(LightningModule):
 
         self.superglue = SuperGlue(args.model.superglue)
         self.superpoint = SuperPoint(args.model.superpoint)
+        self.lr = None
 
     def prepare_data(self) -> None:
         self.train_set = SparseDataset(f'{ROOT_PATH}/' + self.hparams.data.train_path,
@@ -454,6 +456,8 @@ class SuperGlueLightning(LightningModule):
                                            drop_last=True)
 
     def configure_optimizers(self):
+        if self.lr is not None:
+            self.hparams.optimizer.learning_rate = self.lr
         optimizer = torch.optim.Adam(self.superglue.parameters(), lr=self.hparams.optimizer.learning_rate)
         return optimizer
 
@@ -477,6 +481,7 @@ class SuperGlueLightning(LightningModule):
         self.log('train_loss_m', batch['loss_m'], on_epoch=False, on_step=True, sync_dist=True)
         self.log('train_loss_um', batch['loss_um'], on_epoch=False, on_step=True, sync_dist=True)
         self.log('train_loss', batch['loss'], on_epoch=False, on_step=True, sync_dist=True)
+        self.log('bin_score', self.superglue.bin_score, on_epoch=False, on_step=True, sync_dist=True)
         return batch['loss']
 
     def validation_step(self, batch, batch_ind):

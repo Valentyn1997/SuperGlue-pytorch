@@ -174,6 +174,14 @@ class SparseDataset(Dataset):
                             constant_values=pad_value)
         all_matches, all_matches_mask = self._pad_and_mask(all_matches, axis=0, val=0)
 
+        if np.random.rand(1) > 0.5:
+            kp1_np, kp2_np = kp2_np, kp1_np
+            descs1, descs2 = descs2, descs1
+            scores1_np, scores2_np = scores2_np, scores1_np
+            mask1, mask2 = mask2, mask1
+            image, warped = warped, image
+            all_matches[:, 0], all_matches[:, 1] = np.copy(all_matches[:, 1]), np.copy(all_matches[:, 0])
+
         return {
             'keypoints0': kp1_np,
             'keypoints1': kp2_np,
