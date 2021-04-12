@@ -19,7 +19,7 @@ import torch
 from omegaconf import DictConfig
 
 from models.superpoint import SuperPoint
-from models.superglue import SuperGlue, SuperGlueLightning
+from models.superglue_trainer import SuperGlueLightning
 from models.matchingForTraining import MatchingForTraining
 import logging
 
@@ -131,7 +131,7 @@ def main(args: DictConfig):
                       max_epochs=args.exp.epochs,
                       accumulate_grad_batches=args.exp.accumulate_grad_batches,
                       checkpoint_callback=checkpoint_callback if args.exp.checkpoint else None,
-                      val_check_interval=0.1,
+                      val_check_interval=args.exp.val_check_interval,
                       # limit_val_batches=args.data.val_size,
                       auto_lr_find=False,
                       accelerator='ddp',

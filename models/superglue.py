@@ -49,6 +49,8 @@ from omegaconf import DictConfig
 from torch.autograd import Variable
 import matplotlib.cm as cm
 from os.path import abspath, dirname
+import numpy as np
+import random
 
 from load_data import SparseDataset
 from models.superpoint import SuperPoint
@@ -273,7 +275,7 @@ class SuperGlue(nn.Module):
 
         self.final_proj = nn.Conv1d(self.config['descriptor_dim'], self.config['descriptor_dim'], kernel_size=1, bias=True)
 
-        bin_score = torch.nn.Parameter(torch.tensor(1.))
+        bin_score = torch.nn.Parameter(torch.tensor(self.config['init_bin_score']))
         self.register_parameter('bin_score', bin_score)
 
         # assert self.config['weights'] in ['indoor', 'outdoor']
@@ -408,121 +410,3 @@ class SuperGlue(nn.Module):
                 'loss': None,
                 'skip_train': True
             }
-
-
-class SuperGlueLightning(LightningModule):
-
-    def __init__(self, args: DictConfig):
-        super().__init__()
-        self.hparams = args  # Will be logged to mlflow
-
-        # make sure the flags are properly used
-        assert not (args.exp.opencv_display and not args.exp.viz), 'Must use --viz with --opencv_display'
-        assert not (args.exp.opencv_display and not args.exp.fast_viz), 'Cannot use --opencv_display without --fast_viz'
-        assert not (args.exp.fast_viz and not args.exp.viz), 'Must use --viz with --fast_viz'
-        assert not (args.exp.fast_viz and args.exp.viz_extension == 'pdf'), 'Cannot use pdf extension with --fast_viz'
-
-        # store viz results
-        eval_output_dir = Path(f'{ROOT_PATH}/' + args.data.eval_output_dir)
-        eval_output_dir.mkdir(exist_ok=True, parents=True)
-        print('Will write visualization images to directory \"{}\"'.format(eval_output_dir))
-
-        self.superglue = SuperGlue(args.model.superglue)
-        self.superpoint = SuperPoint(args.model.superpoint)
-        self.lr = None
-
-    def prepare_data(self) -> None:
-        self.train_set = SparseDataset(f'{ROOT_PATH}/' + self.hparams.data.train_path,
-                                       self.hparams.model.superpoint.max_keypoints,
-                                       self.hparams.data.resize,
-                                       self.hparams.data.resize_float,
-                                       self.hparams.model.superglue.min_keypoints,
-                                       self.superpoint)
-        self.val_set = SparseDataset(f'{ROOT_PATH}/' + self.hparams.data.val_path,
-                                     self.hparams.model.superpoint.max_keypoints,
-                                     self.hparams.data.resize,
-                                     self.hparams.data.resize_float,
-                                     self.hparams.model.superglue.min_keypoints,
-                                     self.superpoint)
-        self.train_set.files = self.train_set.files[:self.hparams.data.train_size]
-        self.val_set.files = self.val_set.files[:self.hparams.data.val_size]
-
-    def train_dataloader(self) -> torch.utils.data.DataLoader:
-        return torch.utils.data.DataLoader(dataset=self.train_set, shuffle=True, batch_size=self.hparams.data.batch_size.train,
-                                           drop_last=True)
-
-    def val_dataloader(self) -> torch.utils.data.DataLoader:
-        return torch.utils.data.DataLoader(dataset=self.val_set, shuffle=True, batch_size=self.hparams.data.batch_size.val,
-                                           drop_last=True)
-
-    def configure_optimizers(self):
-        if self.lr is not None:
-            self.hparams.optimizer.learning_rate = self.lr
-        optimizer = torch.optim.Adam(self.superglue.parameters(), lr=self.hparams.optimizer.learning_rate)
-        return optimizer
-
-    def training_step(self, batch, batch_ind):
-
-        for k in batch:
-            if k != 'file_name' and k != 'image0' and k != 'image1':
-                if type(batch[k]) == torch.Tensor:
-                    batch[k] = Variable(batch[k])
-                else:
-                    batch[k] = Variable(torch.stack(batch[k]))
-
-        data = self.superglue(batch)
-        batch = {**batch, **data}
-
-        if batch['skip_train']:  # image has no keypoint
-            return None
-
-        # Loss & Metrics
-        self.log('train_hits_1', hits_at_one(batch).mean(), on_epoch=False, on_step=True, sync_dist=True)
-        self.log('train_loss_m', batch['loss_m'], on_epoch=False, on_step=True, sync_dist=True)
-        self.log('train_loss_um', batch['loss_um'], on_epoch=False, on_step=True, sync_dist=True)
-        self.log('train_loss', batch['loss'], on_epoch=False, on_step=True, sync_dist=True)
-        self.log('bin_score', self.superglue.bin_score, on_epoch=False, on_step=True, sync_dist=True)
-        return batch['loss']
-
-    def validation_step(self, batch, batch_ind):
-
-        for k in batch:
-            if k != 'file_name' and k != 'image0' and k != 'image1':
-                if type(batch[k]) != torch.Tensor:
-                    batch[k] = torch.stack(batch[k])
-
-        data = self.superglue(batch)
-        batch = {**batch, **data}
-
-        if batch['skip_train']:  # image has no keypoint
-            return None
-
-        # Loss & Metrics
-        self.log('val_hits_1', hits_at_one(batch).mean(), on_epoch=True, on_step=False, sync_dist=True)
-        self.log('val_loss', batch['loss'], on_epoch=True, on_step=False, sync_dist=True)
-        self.log('val_loss_m', batch['loss_m'], on_epoch=True, on_step=False, sync_dist=True)
-        self.log('val_loss_um', batch['loss_um'], on_epoch=True, on_step=False, sync_dist=True)
-        return batch['loss']
-
-    def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx) -> None:
-        pass
-        # if (self.trainer.global_step + 1) % 50 == 0 and len(outputs[0]) > 0:
-        #     outputs = outputs[0][0]['extra']
-        #     image0, image1 = outputs['image0'].cpu().numpy()[0] * 255., outputs['image1'].cpu().numpy()[0] * 255.
-        #     kpts0, kpts1 = outputs['keypoints0'][0].cpu().numpy(), outputs['keypoints1'][0].cpu().numpy()
-        #     matches, conf = outputs['matches0'].cpu().detach().numpy(), outputs['matching_scores0'].cpu().detach().numpy()
-        #     image0 = read_image_modified(image0, self.hparams.data.resize, self.hparams.data.resize_float)
-        #     image1 = read_image_modified(image1, self.hparams.data.resize, self.hparams.data.resize_float)
-        #     valid = matches > -1
-        #     mkpts0 = kpts0[valid]
-        #     mkpts1 = kpts1[matches[valid]]
-        #     mconf = conf[valid]
-        #     viz_path = self.hparams.data.eval_output_dir + \
-        #                f'{str(self.trainer.global_step)}_matches.{self.hparams.exp.viz_extension}'
-        #     color = cm.jet(mconf)
-        #     stem = outputs['file_name']
-        #     text = []
-        #
-        #     make_matching_plot(image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, viz_path, stem, stem,
-        #                        self.hparams.exp.show_keypoints, self.hparams.exp.fast_viz, self.hparams.exp.opencv_display,
-        #                        'Matches')

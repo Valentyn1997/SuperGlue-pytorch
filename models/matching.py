@@ -78,6 +78,10 @@ class Matching(torch.nn.Module):
             if isinstance(data[k], (list, tuple)):
                 data[k] = torch.stack(data[k])
 
+        # Masking
+        data['mask0'] = torch.ones((1, data['keypoints0'].shape[1])).type_as(data['keypoints0'])
+        data['mask1'] = torch.ones((1, data['keypoints1'].shape[1])).type_as(data['keypoints1'])
+
         # Perform the matching
         pred = {**pred, **self.superglue(data)}
 
