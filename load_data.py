@@ -96,104 +96,115 @@ class SparseDataset(Dataset):
         width, height = image.shape[:2]
         corners = np.array([[0, 0], [0, height], [width, 0], [width, height]], dtype=np.float32)
 
-        kp1, kp2, all_matches = [], [], []
+        # kp1, kp2, all_matches = [], [], []
+        i = 0
+        while i < 100:
 
-        warp = np.random.randint(-224, 224, size=(4, 2)).astype(np.float32)
+            warp = np.random.randint(-224, 224, size=(4, 2)).astype(np.float32)
 
-        # get the corresponding warped image
-        M = cv2.getPerspectiveTransform(corners, corners + warp)
-        warped = cv2.warpPerspective(src=image, M=M, dsize=(image.shape[1], image.shape[0]))  # return an image type
+            # get the corresponding warped image
+            M = cv2.getPerspectiveTransform(corners, corners + warp)
+            warped = cv2.warpPerspective(src=image, M=M, dsize=(image.shape[1], image.shape[0]))  # return an image type
 
-        # extract keypoints of the image pair using SIFT
-        kp1_np, descs1, scores1_np = self.detector.detect(image)
-        kp2_np, descs2, scores2_np = self.detector.detect(warped)
+            # extract keypoints of the image pair using SIFT
+            kp1_np, descs1, scores1_np = self.detector.detect(image)
+            kp2_np, descs2, scores2_np = self.detector.detect(warped)
+
+            # skip this image pair if no keypoints detected in image
+            if len(kp1_np) < self.min_keypoints:
+                break
+
+            if len(kp2_np) < self.min_keypoints:
+                i += 1
+                continue
+
+            image = torch.from_numpy(image / 255.)[None].float()
+            warped = torch.from_numpy(warped / 255.)[None].float()
+
+            # obtain the matching matrix of the image pair
+            # matched = self.matcher.match(descs1, descs2)
+            kp1_projected = cv2.perspectiveTransform(kp1_np.reshape((1, -1, 2)), M)[0, :, :]
+            dists = cdist(kp1_projected, kp2_np)
+
+            min1 = np.argmin(dists, axis=0)
+            min2 = np.argmin(dists, axis=1)
+
+            min1v = np.min(dists, axis=1)
+            min1f = min2[min1v < 3]
+
+            xx = np.where(min2[min1] == np.arange(min1.shape[0]))[0]
+            matches = np.intersect1d(min1f, xx)
+
+            missing1 = np.setdiff1d(np.arange(kp1_np.shape[0]), min1[matches])
+            missing2 = np.setdiff1d(np.arange(kp2_np.shape[0]), matches)
+
+            MN = np.concatenate([min1[matches][np.newaxis, :], matches[np.newaxis, :]])
+            # MN2 = np.concatenate([missing1[np.newaxis, :], (len(kp2)) * np.ones((1, len(missing1)), dtype=np.int64)])
+            # MN3 = np.concatenate([(len(kp1)) * np.ones((1, len(missing2)), dtype=np.int64), missing2[np.newaxis, :]])
+            all_matches = MN.T  # np.concatenate([MN, MN2, MN3], axis=1).T
+            # all_matches = np.unique(all_matches, axis=0)
+
+            # if len(all_matches) < 2:
+            #     continue
+
+            # kp1_np = kp1_np.reshape((2, -1))
+            # kp2_np = kp2_np.reshape((2, -1))
+            # scores1_np = scores1_np.reshape((1, -1))
+            # scores2_np = scores2_np.reshape((1, -1))
+            # descs1 = np.pad((descs1 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
+            # descs2 = np.pad((descs2 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
+
+            # Padding
+            pad_value = - 10 ** 6
+            kp1_np, mask1 = self._pad_and_mask(kp1_np, axis=0, val=pad_value)
+            kp2_np, mask2 = self._pad_and_mask(kp2_np, axis=0, val=pad_value)
+            descs1, _ = self._pad_and_mask(descs1, axis=1, val=pad_value)
+            descs2, _ = self._pad_and_mask(descs2, axis=1, val=pad_value)
+            scores1_np = np.pad(scores1_np, pad_width=((0, self.nfeatures - scores1_np.shape[0]),), mode='constant',
+                                constant_values=pad_value)
+            scores2_np = np.pad(scores2_np, pad_width=((0, self.nfeatures - scores2_np.shape[0]),), mode='constant',
+                                constant_values=pad_value)
+            all_matches, all_matches_mask = self._pad_and_mask(all_matches, axis=0, val=0)
+
+            if np.random.rand(1) > 0.5:
+                kp1_np, kp2_np = kp2_np, kp1_np
+                descs1, descs2 = descs2, descs1
+                scores1_np, scores2_np = scores2_np, scores1_np
+                mask1, mask2 = mask2, mask1
+                image, warped = warped, image
+                all_matches[:, 0], all_matches[:, 1] = np.copy(all_matches[:, 1]), np.copy(all_matches[:, 0])
+
+            return {
+                'keypoints0': kp1_np,
+                'keypoints1': kp2_np,
+                'descriptors0': descs1,
+                'descriptors1': descs2,
+                'scores0': scores1_np,
+                'scores1': scores2_np,
+                'mask0': mask1,
+                'mask1': mask2,
+                'image0': image,
+                'image1': warped,
+                'all_matches': all_matches,
+                'all_matches_mask': all_matches_mask,
+                'file_name': file_name
+            }
 
         image = torch.from_numpy(image / 255.)[None].float()
         warped = torch.from_numpy(warped / 255.)[None].float()
 
-        # skip this image pair if no keypoints detected in image
-        if len(kp1_np) < self.min_keypoints or len(kp2_np) < self.min_keypoints:
-            return {
-                'keypoints0': np.zeros([self.nfeatures, 2]),
-                'keypoints1': np.zeros([self.nfeatures, 2]),
-                'descriptors0': np.zeros([self.desc_dim, self.nfeatures]),
-                'descriptors1': np.zeros([self.desc_dim, self.nfeatures]),
-                'scores0': np.zeros([self.nfeatures, ]),
-                'scores1': np.zeros([self.nfeatures, ]),
-                'mask0': np.zeros([self.nfeatures, ]),
-                'mask1': np.zeros([self.nfeatures, ]),
-                'all_matches': np.zeros([self.nfeatures, 2], dtype=int),
-                'all_matches_mask': np.zeros([self.nfeatures, ]),
-                'image0': image,
-                'image1': warped,
-                'file_name': file_name
-            }
-
-        # obtain the matching matrix of the image pair
-        # matched = self.matcher.match(descs1, descs2)
-        kp1_projected = cv2.perspectiveTransform(kp1_np.reshape((1, -1, 2)), M)[0, :, :]
-        dists = cdist(kp1_projected, kp2_np)
-
-        min1 = np.argmin(dists, axis=0)
-        min2 = np.argmin(dists, axis=1)
-
-        min1v = np.min(dists, axis=1)
-        min1f = min2[min1v < 3]
-
-        xx = np.where(min2[min1] == np.arange(min1.shape[0]))[0]
-        matches = np.intersect1d(min1f, xx)
-
-        missing1 = np.setdiff1d(np.arange(kp1_np.shape[0]), min1[matches])
-        missing2 = np.setdiff1d(np.arange(kp2_np.shape[0]), matches)
-
-        MN = np.concatenate([min1[matches][np.newaxis, :], matches[np.newaxis, :]])
-        # MN2 = np.concatenate([missing1[np.newaxis, :], (len(kp2)) * np.ones((1, len(missing1)), dtype=np.int64)])
-        # MN3 = np.concatenate([(len(kp1)) * np.ones((1, len(missing2)), dtype=np.int64), missing2[np.newaxis, :]])
-        all_matches = MN.T  # np.concatenate([MN, MN2, MN3], axis=1).T
-        # all_matches = np.unique(all_matches, axis=0)
-
-        # if len(all_matches) < 2:
-        #     continue
-
-        # kp1_np = kp1_np.reshape((2, -1))
-        # kp2_np = kp2_np.reshape((2, -1))
-        # scores1_np = scores1_np.reshape((1, -1))
-        # scores2_np = scores2_np.reshape((1, -1))
-        # descs1 = np.pad((descs1 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
-        # descs2 = np.pad((descs2 / 256.).T, pad_width=((0, 128), (0, 0)), constant_values=0.0)
-
-        # Padding
-        pad_value = - 10 ** 6
-        kp1_np, mask1 = self._pad_and_mask(kp1_np, axis=0, val=pad_value)
-        kp2_np, mask2 = self._pad_and_mask(kp2_np, axis=0, val=pad_value)
-        descs1, _ = self._pad_and_mask(descs1, axis=1, val=pad_value)
-        descs2, _ = self._pad_and_mask(descs2, axis=1, val=pad_value)
-        scores1_np = np.pad(scores1_np, pad_width=((0, self.nfeatures - scores1_np.shape[0]),), mode='constant',
-                            constant_values=pad_value)
-        scores2_np = np.pad(scores2_np, pad_width=((0, self.nfeatures - scores2_np.shape[0]),), mode='constant',
-                            constant_values=pad_value)
-        all_matches, all_matches_mask = self._pad_and_mask(all_matches, axis=0, val=0)
-
-        if np.random.rand(1) > 0.5:
-            kp1_np, kp2_np = kp2_np, kp1_np
-            descs1, descs2 = descs2, descs1
-            scores1_np, scores2_np = scores2_np, scores1_np
-            mask1, mask2 = mask2, mask1
-            image, warped = warped, image
-            all_matches[:, 0], all_matches[:, 1] = np.copy(all_matches[:, 1]), np.copy(all_matches[:, 0])
-
         return {
-            'keypoints0': kp1_np,
-            'keypoints1': kp2_np,
-            'descriptors0': descs1,
-            'descriptors1': descs2,
-            'scores0': scores1_np,
-            'scores1': scores2_np,
-            'mask0': mask1,
-            'mask1': mask2,
+            'keypoints0': np.zeros([self.nfeatures, 2]),
+            'keypoints1': np.zeros([self.nfeatures, 2]),
+            'descriptors0': np.zeros([self.desc_dim, self.nfeatures]),
+            'descriptors1': np.zeros([self.desc_dim, self.nfeatures]),
+            'scores0': np.zeros([self.nfeatures, ]),
+            'scores1': np.zeros([self.nfeatures, ]),
+            'mask0': np.zeros([self.nfeatures, ]),
+            'mask1': np.zeros([self.nfeatures, ]),
+            'all_matches': np.zeros([self.nfeatures, 2], dtype=int),
+            'all_matches_mask': np.zeros([self.nfeatures, ]),
             'image0': image,
             'image1': warped,
-            'all_matches': all_matches,
-            'all_matches_mask': all_matches_mask,
             'file_name': file_name
         }

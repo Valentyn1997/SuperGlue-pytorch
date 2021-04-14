@@ -8,4 +8,4 @@
 source venv/bin/activate
 export PYTHONPATH=$PYTHONPATH:./
 ssh -N -f -L localhost:5100:localhost:5100 ubuntu@10.195.1.136
-PYTHONPATH=. python3 train.py data.batch_size.train=16 model.superglue.min_keypoints=256
+PYTHONPATH=. python3 train.py data.batch_size.train=16 model.superglue.min_keypoints=256 model.superglue.trainable_bin_score=False

@@ -61,6 +61,7 @@ model:
     min_keypoints: 512
     sinkhorn_iterations: 100  # Number of Sinkhorn iterations performed by SuperGlue
     init_bin_score: 1.0
+    trainable_bin_score: True
   superpoint:
     nms_radius: 4  # SuperPoint Non Maximum Suppression (NMS) radius (Must be positive)
     keypoint_threshold: 0.005  # SuperPoint keypoint detector confidence threshold

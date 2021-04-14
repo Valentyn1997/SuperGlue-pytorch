@@ -156,7 +156,7 @@ class SuperGlueLightning(LightningModule):
             data_dir = Path(f'{ROOT_PATH}/' + eval_data.data_dir)
             # moving_dir = Path(f'{ROOT_PATH}/' + 'data/ScanNet/test_subset')
             print('Looking for data in directory \"{}\"'.format(data_dir))
-            results_dir = Path(f'{ROOT_PATH}/' + eval_data.results_dir)
+            results_dir = Path(os.getcwd() + '/' + eval_data.results_dir)
             results_dir.mkdir(exist_ok=True, parents=True)
             print('Will write matches to directory \"{}\"'.format(results_dir))
 

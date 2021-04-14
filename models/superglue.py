@@ -275,8 +275,11 @@ class SuperGlue(nn.Module):
 
         self.final_proj = nn.Conv1d(self.config['descriptor_dim'], self.config['descriptor_dim'], kernel_size=1, bias=True)
 
-        bin_score = torch.nn.Parameter(torch.tensor(self.config['init_bin_score']))
-        self.register_parameter('bin_score', bin_score)
+        if self.config['trainable_bin_score']:
+            bin_score = torch.nn.Parameter(torch.tensor(self.config['init_bin_score']))
+            self.register_parameter('bin_score', bin_score)
+        else:
+            self.bin_score = torch.tensor(self.config['init_bin_score'])
 
         # assert self.config['weights'] in ['indoor', 'outdoor']
         if self.config['weights'] is not None:
