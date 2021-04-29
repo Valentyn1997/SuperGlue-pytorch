@@ -279,7 +279,8 @@ class SuperGlue(nn.Module):
             bin_score = torch.nn.Parameter(torch.tensor(self.config['init_bin_score']))
             self.register_parameter('bin_score', bin_score)
         else:
-            self.bin_score = torch.tensor(self.config['init_bin_score'])
+            bin_score = torch.tensor(self.config['init_bin_score'])
+            self.register_buffer('bin_score', bin_score)
 
         # assert self.config['weights'] in ['indoor', 'outdoor']
         if self.config['weights'] is not None:

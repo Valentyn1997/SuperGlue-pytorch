@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --output=./train2.log  # send stdout to outfile
+#SBATCH --output=./train.log  # send stdout to outfile
 #SBATCH -p debug
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:2
-#SBATCH -w worker-2
+#SBATCH -w worker-3
 
 source venv/bin/activate
 export PYTHONPATH=$PYTHONPATH:./

@@ -11,6 +11,7 @@ import matplotlib.cm as cm
 from os.path import abspath, dirname
 import numpy as np
 import random
+from pytorch_lightning.utilities import rank_zero_only
 
 from load_data import SparseDataset
 from models.superpoint import SuperPoint
@@ -121,6 +122,7 @@ class SuperGlueLightning(LightningModule):
         self.log('val_loss_um', batch['loss_um'], on_epoch=True, on_step=False, sync_dist=True)
         return batch['loss']
 
+    @rank_zero_only
     def on_train_epoch_end(self, outputs) -> None:
         for eval_data in self.hparams.eval:
 
